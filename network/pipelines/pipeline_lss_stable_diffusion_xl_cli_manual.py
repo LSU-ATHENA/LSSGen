@@ -45,7 +45,7 @@ from diffusers.models.attention_processor import (
     XFormersAttnProcessor,
 )
 from diffusers.models.lora import adjust_lora_scale_text_encoder
-from diffusers.schedulers import KarrasDiffusionSchedulers
+from diffusers.schedulers.scheduling_utils import SchedulerMixin
 from diffusers.utils import (
     USE_PEFT_BACKEND,
     deprecate,
@@ -223,8 +223,16 @@ def _parse_manual_stage_steps(value, stage_count, total_steps):
         raise ValueError(f"manual_stage_steps needs {stage_count} cumulative values, got {len(endpoints)}.")
     if endpoints[-1] != int(total_steps):
         raise ValueError(f"Final manual_stage_steps value must equal num_inference_steps ({total_steps}).")
-    if any(x <= 0 for x in endpoints) or endpoints != sorted(endpoints) or len(set(endpoints)) != len(endpoints):
-        raise ValueError("manual_stage_steps must be positive, cumulative, and strictly increasing.")
+    if (
+        endpoints[0] < 0
+        or any(x <= 0 for x in endpoints[1:])
+        or endpoints != sorted(endpoints)
+        or len(set(endpoints)) != len(endpoints)
+    ):
+        raise ValueError(
+            "manual_stage_steps must be cumulative and strictly increasing; "
+            "the first value may be zero and all remaining values must be positive."
+        )
 
     prev = 0
     lengths = []
@@ -354,7 +362,7 @@ class LSSStableDiffusionXLPipeline(
         tokenizer: CLIPTokenizer,
         tokenizer_2: CLIPTokenizer,
         unet: UNet2DConditionModel,
-        scheduler: KarrasDiffusionSchedulers,
+        scheduler: SchedulerMixin,
         image_encoder: CLIPVisionModelWithProjection = None,
         feature_extractor: CLIPImageProcessor = None,
         force_zeros_for_empty_prompt: bool = True,
@@ -704,8 +712,8 @@ class LSSStableDiffusionXLPipeline(
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.prepare_extra_step_kwargs
     def prepare_extra_step_kwargs(self, generator, eta):
         # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
-        # eta (η) is only used with the DDIMScheduler, it will be ignored for other schedulers.
-        # eta corresponds to η in DDIM paper: https://arxiv.org/abs/2010.02502
+        # eta (Î·) is only used with the DDIMScheduler, it will be ignored for other schedulers.
+        # eta corresponds to Î· in DDIM paper: https://arxiv.org/abs/2010.02502
         # and should be between [0, 1]
 
         accepts_eta = "eta" in set(inspect.signature(self.scheduler.step).parameters.keys())
@@ -1063,7 +1071,7 @@ class LSSStableDiffusionXLPipeline(
             num_images_per_prompt (`int`, *optional*, defaults to 1):
                 The number of images to generate per prompt.
             eta (`float`, *optional*, defaults to 0.0):
-                Corresponds to parameter eta (η) in the DDIM paper: https://arxiv.org/abs/2010.02502. Only applies to
+                Corresponds to parameter eta (Î·) in the DDIM paper: https://arxiv.org/abs/2010.02502. Only applies to
                 [`schedulers.DDIMScheduler`], will be ignored for others.
             generator (`torch.Generator` or `List[torch.Generator]`, *optional*):
                 One or a list of [torch generator(s)](https://pytorch.org/docs/stable/generated/torch.Generator.html)
@@ -1104,7 +1112,7 @@ class LSSStableDiffusionXLPipeline(
                 [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
             guidance_rescale (`float`, *optional*, defaults to 0.0):
                 Guidance rescale factor proposed by [Common Diffusion Noise Schedules and Sample Steps are
-                Flawed](https://arxiv.org/pdf/2305.08891.pdf) `guidance_scale` is defined as `φ` in equation 16. of
+                Flawed](https://arxiv.org/pdf/2305.08891.pdf) `guidance_scale` is defined as `Ï†` in equation 16. of
                 [Common Diffusion Noise Schedules and Sample Steps are Flawed](https://arxiv.org/pdf/2305.08891.pdf).
                 Guidance rescale factor should fix overexposure when using zero terminal SNR.
             original_size (`Tuple[int]`, *optional*, defaults to (1024, 1024)):
@@ -1392,6 +1400,37 @@ class LSSStableDiffusionXLPipeline(
                 scaled_latent_height = scaled_height // self.vae_scale_factor
                 stage_start_sigma = float(spec["start_sigma"])
                 first_stage = latents is None
+
+                if spec["exact_steps"] and int(spec["requested_steps"]) == 0:
+                    if latents is None:
+                        noise = randn_tensor(
+                            (
+                                effective_batch_size,
+                                num_channels_latents,
+                                scaled_latent_height,
+                                scaled_latent_width,
+                            ),
+                            generator=generator,
+                            device=device,
+                            dtype=prompt_embeds.dtype,
+                        )
+                        latents = noise * self.scheduler.init_noise_sigma
+                    self.last_stage_info.append(
+                        {
+                            "stage_index": int(spec["index"]),
+                            "resolution": f"{scaled_width}x{scaled_height}",
+                            "latent_resolution": f"{scaled_latent_width}x{scaled_latent_height}",
+                            "requested_steps": 0,
+                            "actual_steps": 0,
+                            "start_sigma": float(stage_start_sigma),
+                            "shorten_factor": float(spec["shorten_factor"]),
+                            "manual_stage": True,
+                        }
+                    )
+                    progress_bar.set_description(
+                        "Stage steps " + str([x["actual_steps"] for x in self.last_stage_info]) + " |"
+                    )
+                    continue
 
                 original_size = (scaled_height, scaled_width)
                 target_size = (scaled_height, scaled_width)
