@@ -16,10 +16,10 @@
 set -euo pipefail
 
 source /work/hchoi12/miniforge3/etc/profile.d/conda.sh
-conda activate /work/hchoi12/conda_envs/lssgen
+conda activate /work/hchoi12/conda_envs/lssgen-metrics
 
 cd /work/hchoi12/LSSGen-replication
-python -c "import pyiqa; print('PyIQA', pyiqa.__version__)"
+python -c "import pyiqa, setuptools; assert pyiqa.__version__ == '0.1.16'; assert setuptools.__version__ == '80.10.2'; print('PyIQA', pyiqa.__version__, '| Setuptools', setuptools.__version__)"
 
 case "${SLURM_ARRAY_TASK_ID}" in
   0) IMAGE_DIR="/work/hchoi12/outputs/replication/lss_sdxl_2048" ;;
@@ -31,4 +31,3 @@ python score_pyiqa.py \
   "${IMAGE_DIR}" \
   --output-dir "${IMAGE_DIR}/metrics" \
   --device cuda
-
