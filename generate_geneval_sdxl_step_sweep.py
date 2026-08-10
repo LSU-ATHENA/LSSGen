@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Generate GenEval-format SDXL images for a two-stage step experiment.
 
-The model and latent upsampler are loaded once per process. Allocations may be
-supplied as explicit pairs, fixed-total partitions, or an independent grid.
-Dry-run is the default; pass --execute only after reviewing sweep_plan.csv.
+The step sweep keeps 87 total denoising calls and reallocates them between
+the 1024x1024 and 2048x2048 stages in five-call increments. Dry-run is the
+default; pass --execute after reviewing sweep_plan.csv.
 """
 
 from __future__ import annotations
@@ -18,7 +18,17 @@ from pathlib import Path
 from typing import Any
 
 
-SCRIPT_VERSION = "1.1"
+SCRIPT_VERSION = "1.3"
+TOTAL_STAGE_STEPS = 87
+LOW_STAGE_STEP_VALUES = tuple(range(0, 86, 5))
+
+
+def step_allocation_pairs() -> list[tuple[int, int]]:
+    """Generate the 87-step allocation sweep, including the 50/37 baseline."""
+    return [
+        (stage1_steps, TOTAL_STAGE_STEPS - stage1_steps)
+        for stage1_steps in LOW_STAGE_STEP_VALUES
+    ]
 
 
 @dataclass(frozen=True)
@@ -66,8 +76,8 @@ def parse_allocation_pairs(text: str) -> list[tuple[int, int]]:
             stage1_steps, stage2_steps = int(left), int(right)
         except ValueError as exc:
             raise ValueError(f"Invalid allocation pair: {raw}") from exc
-        if stage1_steps <= 0 or stage2_steps <= 0:
-            raise ValueError("Allocation steps must be positive")
+        if stage1_steps < 0 or stage2_steps <= 0:
+            raise ValueError("Stage 1 must be non-negative and Stage 2 must be positive")
         pairs.append((stage1_steps, stage2_steps))
     if not pairs:
         raise ValueError("--allocations cannot be empty")
@@ -185,6 +195,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("metadata_file", type=Path)
     parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument(
+        "--step-sweep",
+        action="store_true",
+        help="Use the 0/87 through 85/2 fixed-total step sweep",
+    )
     parser.add_argument("--allocations", help="Explicit pairs, e.g. 10:40,15:35,20:30")
     parser.add_argument("--stage1-values", help="Comma-separated Stage 1 values")
     parser.add_argument("--stage2-values", help="Comma-separated Stage 2 values for an independent grid")
@@ -193,10 +208,10 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help="Derive Stage 2 as fixed total minus each --stage1-values entry",
     )
-    parser.add_argument("--stage-resolutions", default="512x512,1024x1024")
-    parser.add_argument("--width", type=int, default=1024)
-    parser.add_argument("--height", type=int, default=1024)
-    parser.add_argument("--samples-per-prompt", type=int, default=1)
+    parser.add_argument("--stage-resolutions", default="1024x1024,2048x2048")
+    parser.add_argument("--width", type=int, default=2048)
+    parser.add_argument("--height", type=int, default=2048)
+    parser.add_argument("--samples-per-prompt", type=int, default=4)
     parser.add_argument("--prompt-start", type=int, default=0)
     prompt_group = parser.add_mutually_exclusive_group()
     prompt_group.add_argument("--prompt-limit", type=int, default=1)
@@ -211,7 +226,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-resolution", type=int, default=1024)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--dtype", choices=("float16", "bfloat16", "float32"), default="float16")
+    parser.add_argument("--dtype", choices=("float16", "bfloat16", "float32"), default="bfloat16")
     parser.add_argument("--variant", default="fp16")
     parser.add_argument("--no-safetensors", action="store_true")
     parser.add_argument("--enable-attention-slicing", action="store_true")
@@ -238,7 +253,12 @@ def validated_experiment(args: argparse.Namespace):
     if not 0 < args.start_sigma <= 1:
         raise ValueError("--start-sigma must be in (0, 1]")
 
-    if args.allocations:
+    if args.step_sweep:
+        if args.allocations or args.stage1_values or args.stage2_values or args.fixed_total is not None:
+            raise ValueError("--step-sweep cannot be combined with another allocation mode")
+        allocations = indexed_allocations(step_allocation_pairs())
+        allocation_mode = "step_sweep_87"
+    elif args.allocations:
         if args.stage1_values or args.stage2_values or args.fixed_total is not None:
             raise ValueError("--allocations cannot be combined with stage value or fixed-total options")
         allocations = indexed_allocations(parse_allocation_pairs(args.allocations))
@@ -264,6 +284,16 @@ def validated_experiment(args: argparse.Namespace):
         stage2_values = parse_positive_int_csv(args.stage2_values, "--stage2-values")
         allocations = build_allocations(stage1_values, stage2_values)
         allocation_mode = "independent_grid"
+
+    if allocation_mode == "step_sweep_87":
+        if len(allocations) != 18:
+            raise RuntimeError("The step sweep must contain exactly 18 allocations")
+        if any(allocation.total_steps != TOTAL_STAGE_STEPS for allocation in allocations):
+            raise RuntimeError("Every step-sweep allocation must total 87 calls")
+        if (50, 37) not in {
+            (allocation.stage1_steps, allocation.stage2_steps) for allocation in allocations
+        }:
+            raise RuntimeError("The step sweep must include the 50/37 baseline")
     resolutions = parse_resolutions(args.stage_resolutions)
     if resolutions[-1] != (args.width, args.height):
         raise ValueError(
@@ -305,7 +335,6 @@ def validated_experiment(args: argparse.Namespace):
 
 def load_pipeline(args: argparse.Namespace):
     import torch
-    from diffusers import DPMSolverMultistepScheduler
 
     from network.models.upsampler import LatentUpSampler
     from network.pipelines.pipeline_lss_stable_diffusion_xl_cli_manual import (
@@ -333,18 +362,15 @@ def load_pipeline(args: argparse.Namespace):
 
     print(f"Loading SDXL once: {args.model_path}")
     pipe = LSSStableDiffusionXLPipeline.from_pretrained(args.model_path, **pipe_kwargs).to(args.device)
-    pipe.scheduler = DPMSolverMultistepScheduler.from_config(
-        pipe.scheduler.config,
-        algorithm_type="dpmsolver++",
-        use_karras_sigmas=True,
-    )
+    scheduler_class = type(pipe.scheduler).__name__
+    print(f"Scheduler loaded from model configuration: {scheduler_class}")
     if not args.no_vae_slicing and hasattr(pipe, "enable_vae_slicing"):
         pipe.enable_vae_slicing()
     if not args.no_vae_tiling and hasattr(pipe, "enable_vae_tiling"):
         pipe.enable_vae_tiling()
     if args.enable_attention_slicing and hasattr(pipe, "enable_attention_slicing"):
         pipe.enable_attention_slicing()
-    return torch, pipe
+    return torch, pipe, scheduler_class
 
 
 def expected_config(
@@ -353,6 +379,7 @@ def expected_config(
     resolutions: list[tuple[int, int]],
     allocation: Allocation,
     selected_metadata: list[tuple[int, dict[str, Any]]],
+    scheduler_class: str,
 ) -> dict[str, Any]:
     return {
         "script_version": SCRIPT_VERSION,
@@ -376,7 +403,7 @@ def expected_config(
         "negative_prompt": args.negative_prompt,
         "seed_policy": "base_seed_plus_sample_index_reset_for_each_prompt",
         "base_seed": args.seed,
-        "scheduler": "DPMSolverMultistepScheduler(dpmsolver++, Karras sigmas)",
+        "scheduler_class": scheduler_class,
         "device": args.device,
         "dtype": args.dtype,
         "variant": args.variant,
@@ -426,11 +453,19 @@ def generate_allocation(
     resolutions: list[tuple[int, int]],
     selected_metadata: list[tuple[int, dict[str, Any]]],
     allocation: Allocation,
+    scheduler_class: str,
 ) -> None:
     from PIL import Image
 
     allocation_dir = output_root / allocation.allocation_id
-    config = expected_config(args, metadata_path, resolutions, allocation, selected_metadata)
+    config = expected_config(
+        args,
+        metadata_path,
+        resolutions,
+        allocation,
+        selected_metadata,
+        scheduler_class,
+    )
     ensure_allocation_config(allocation_dir, config, resume=not args.no_resume)
 
     min_resolution = min(min(width, height) for width, height in resolutions)
@@ -532,6 +567,7 @@ def generate_allocation(
             "stage1_steps": allocation.stage1_steps,
             "stage2_steps": allocation.stage2_steps,
             "total_calls_per_image": allocation.total_steps,
+            "scheduler_class": scheduler_class,
             "selected_prompt_count": len(selected_metadata),
             "samples_per_prompt": args.samples_per_prompt,
             "expected_image_count": len(selected_metadata) * args.samples_per_prompt,
@@ -582,7 +618,7 @@ def main() -> int:
         print("Dry run only. Add --execute after reviewing the plan.")
         return 0
 
-    torch, pipe = load_pipeline(args)
+    torch, pipe, scheduler_class = load_pipeline(args)
     for allocation in selected_allocations:
         generate_allocation(
             torch,
@@ -593,6 +629,7 @@ def main() -> int:
             resolutions,
             selected_metadata,
             allocation,
+            scheduler_class,
         )
     return 0
 
