@@ -1,5 +1,5 @@
 #!/bin/bash
-# Review template. No allocation is embedded in this file.
+# Run one 87-step allocation per array task.
 #SBATCH -A hpc_aigc_optim
 #SBATCH -p gpu
 #SBATCH -N 1
@@ -8,6 +8,7 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
 #SBATCH --time=72:00:00
+#SBATCH --array=0-17
 #SBATCH --job-name=sdxl-step-sweep
 #SBATCH --output=/work/hchoi12/logs/sdxl-step-%A_%a.out
 #SBATCH --error=/work/hchoi12/logs/sdxl-step-%A_%a.err
@@ -22,12 +23,11 @@ export HUGGINGFACE_HUB_CACHE=/work/hchoi12/cache/huggingface/hub
 
 cd /work/hchoi12/LSSGen-replication
 
-: "${APPROVED_ALLOCATIONS:?Submit with an approved pair, for example --export=ALL,APPROVED_ALLOCATIONS=10:40}"
-
 python generate_geneval_sdxl_step_sweep.py \
   /work/hchoi12/geneval/prompts/evaluation_metadata.jsonl \
   --output-root /work/hchoi12/outputs/sdxl_step_sweep \
-  --allocations "${APPROVED_ALLOCATIONS}" \
+  --step-sweep \
+  --allocation-index "${SLURM_ARRAY_TASK_ID}" \
   --stage-resolutions 1024x1024,2048x2048 \
   --width 2048 \
   --height 2048 \
@@ -35,5 +35,5 @@ python generate_geneval_sdxl_step_sweep.py \
   --all-prompts \
   --guidance 5.0 \
   --start-sigma 0.75 \
-  --dtype float16 \
+  --dtype bfloat16 \
   --execute
