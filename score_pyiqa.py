@@ -82,12 +82,26 @@ def main() -> int:
     }
     rows: list[dict[str, object]] = []
     values: dict[str, list[float]] = {name: [] for name in METRICS}
+    failed_images: list[dict[str, str]] = []
 
     for index, image_path in enumerate(images, start=1):
-        row: dict[str, object] = {"image": str(image_path.relative_to(root))}
-        for name, metric in metric_objects.items():
-            score = scalar(metric(str(image_path)))
-            row[name] = score
+        relative_path = str(image_path.relative_to(root))
+        row: dict[str, object] = {"image": relative_path}
+        try:
+            image_scores = {
+                name: scalar(metric(str(image_path)))
+                for name, metric in metric_objects.items()
+            }
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            row.update({name: "ERROR" for name in METRICS})
+            rows.append(row)
+            failed_images.append({"image": relative_path, "error": error})
+            print(f"[{index}/{len(images)}] ERROR {relative_path}: {error}")
+            continue
+
+        row.update(image_scores)
+        for name, score in image_scores.items():
             values[name].append(score)
         rows.append(row)
         print(f"[{index}/{len(images)}] {row['image']}")
@@ -102,13 +116,16 @@ def main() -> int:
     summary = {
         "image_root": str(root),
         "image_count": len(images),
+        "successful_image_count": len(images) - len(failed_images),
+        "failed_image_count": len(failed_images),
+        "failed_images": failed_images,
         "pyiqa_version": getattr(pyiqa, "__version__", "unknown"),
         "metrics": {
             name: {
-                "mean": statistics.fmean(scores),
-                "population_stddev": statistics.pstdev(scores),
-                "min": min(scores),
-                "max": max(scores),
+                "mean": statistics.fmean(scores) if scores else None,
+                "population_stddev": statistics.pstdev(scores) if scores else None,
+                "min": min(scores) if scores else None,
+                "max": max(scores) if scores else None,
                 "direction": metric_directions[name],
             }
             for name, scores in values.items()
