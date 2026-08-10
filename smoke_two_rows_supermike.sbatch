@@ -1,5 +1,6 @@
 #!/bin/bash
 # One prompt and one image per row using the full paper settings.
+# Run this after code review and before the full 4,424-image launch.
 # Array task 0: LSS-SDXL at 2048x2048
 # Array task 1: LSS-SD1.5 at 1024x1024
 #SBATCH -A hpc_aigc_optim
