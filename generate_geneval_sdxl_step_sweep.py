@@ -351,7 +351,7 @@ def load_pipeline(args: argparse.Namespace):
     dtype = dtype_map[args.dtype]
 
     print(f"Loading latent upsampler once: {args.upsampler_path}")
-    upsampler = LatentUpSampler.from_pretrained(args.upsampler_path, torch_dtype=dtype).to(args.device)
+    upsampler = LatentUpSampler.from_pretrained(args.upsampler_path, torch_dtype=dtype).to(device=args.device, dtype=dtype)
     pipe_kwargs: dict[str, Any] = {
         "latent_upsampler": upsampler,
         "torch_dtype": dtype,
@@ -361,7 +361,7 @@ def load_pipeline(args: argparse.Namespace):
         pipe_kwargs["variant"] = args.variant
 
     print(f"Loading SDXL once: {args.model_path}")
-    pipe = LSSStableDiffusionXLPipeline.from_pretrained(args.model_path, **pipe_kwargs).to(args.device)
+    pipe = LSSStableDiffusionXLPipeline.from_pretrained(args.model_path, **pipe_kwargs).to(device=args.device, dtype=dtype)
     scheduler_class = type(pipe.scheduler).__name__
     print(f"Scheduler loaded from model configuration: {scheduler_class}")
     if not args.no_vae_slicing and hasattr(pipe, "enable_vae_slicing"):

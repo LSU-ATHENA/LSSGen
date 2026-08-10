@@ -6,7 +6,6 @@
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=64G
 #SBATCH --time=72:00:00
 #SBATCH --array=0-17
 #SBATCH --job-name=sdxl-step-sweep
